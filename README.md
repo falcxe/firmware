@@ -6,6 +6,21 @@ Bruce is a versatile ESP32 firmware packed with offensive-security tools, built 
 
 It also supports [M5Stack](https://shop.m5stack.com), [LILYGO](https://lilygo.cc) , [RockBase IoT](https://www.rockbaseiot.com) and [Elecrow](https://www.elecrow.com) products, and works great with the Cardputer, Sticks, M5Cores, T-Decks and T-Embeds.
 
+## :wrench: About this fork
+
+This fork fixes handshake capture over the serial console on `m5stack-cplus2`:
+
+- `capture_handshake()` now returns control to the serial console right after
+  the PCAP for the requested BSSID is written, instead of looping until Esc
+  is pressed on the device.
+- Capture readiness is tracked per BSSID off the actual written file, and
+  stale state from a previous capture is cleared before a new session, so an
+  old capture can no longer be reported for a new target.
+- The `brkcap` stop word is matched as a whole line (byte-by-byte), fixing a
+  case where partial matches could never trigger a stop.
+
+Built and verified with `pio run -e m5stack-cplus2`.
+
 ## :zap: Get Our Official DevKit!
 
 # RF REAPER
