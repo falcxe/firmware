@@ -60,6 +60,13 @@ bool sniffer_full_mode_available();
 bool sniffer_prepare_storage(FS *fs, bool sdDetected);
 void sniffer_wait_for_flush(uint32_t timeoutMs = 2000);
 void sniffer_reset_handshake_cache();
+
+// How many devices have been heard talking to an access point, and how to
+// start counting afresh. A lower bound on the devices on the network: those
+// that said something since counting began.
+uint8_t stationCountForAp(uint64_t apKey);
+void noteStationForAp(uint64_t apKey, const uint8_t *mac);
+void resetStationsForAp(uint64_t apKey);
 void markHandshakeReady(uint64_t key);
 bool sniffer_is_handshake_ready(uint64_t bssidKey);
 

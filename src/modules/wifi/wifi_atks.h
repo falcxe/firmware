@@ -49,7 +49,7 @@ void target_atk_menu(const String &tssid, const String &mac, uint8_t channel);
 
 void target_atk(const String &tssid, const String &mac, uint8_t channel);
 
-void capture_handshake(const String &tssid, const String &mac, uint8_t channel);
+void capture_handshake(const String &tssid, const String &mac, uint8_t channel, bool returnAfterSave = false);
 
 void beaconAttack();
 

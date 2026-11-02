@@ -70,6 +70,42 @@ uint32_t readCallback(cmd *c) {
     return true;
 }
 
+uint32_t streamCallback(cmd *c) {
+    Command cmd(c);
+
+    Argument arg = cmd.getArgument("filepath");
+    String filepath = arg.getValue();
+    filepath.trim();
+    if (filepath.length() == 0) return false;
+    if (!filepath.startsWith("/")) filepath = "/" + filepath;
+
+    FS *fs;
+    if (!getFsStorage(fs) || !(*fs).exists(filepath)) return false;
+
+    // readSmallFile refuses anything past the stack buffer, and a captured
+    // handshake is just over that line, so the plain "read" could never
+    // deliver one. This copies through a small fixed block instead: the file
+    // is never held whole, and a capture of any size comes over intact.
+    File file = (*fs).open(filepath, FILE_READ);
+    if (!file) return false;
+    size_t total = file.size();
+    serialDevice->print("STREAM ");
+    serialDevice->println(total);
+
+    uint8_t buf[256];
+    size_t sent = 0;
+    while (file.available()) {
+        int n = file.read(buf, sizeof(buf));
+        if (n <= 0) break;
+        serialDevice->write(buf, n);
+        sent += n;
+    }
+    file.close();
+    serialDevice->print("END ");
+    serialDevice->println(sent);
+    return true;
+}
+
 uint32_t md5Callback(cmd *c) {
     Command cmd(c);
 
@@ -921,6 +957,9 @@ void createStorageCommand(SimpleCLI *cli) {
 
     Command cmdRead = cmd.addCommand("read", readCallback);
     cmdRead.addPosArg("filepath");
+
+    Command cmdStream = cmd.addCommand("stream", streamCallback);
+    cmdStream.addPosArg("filepath");
 
     Command cmdRemove = cmd.addCommand("remove", removeCallback);
     cmdRemove.addPosArg("filepath");

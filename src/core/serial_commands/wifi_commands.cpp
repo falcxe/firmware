@@ -8,6 +8,7 @@
 #include "modules/wifi/sniffer.h"
 #include "modules/wifi/tcp_utils.h"
 #include <modules/ethernet/ARPScanner.h>
+#include "modules/wifi/wifi_atks.h"
 // #include "modules/wifi/responder.h"
 #endif
 uint32_t wifiCallback(cmd *c) {
@@ -82,7 +83,26 @@ uint32_t snifferCallback(cmd *c) {
 
     return true;
 }
-
+uint32_t captureHandshakeCallback(cmd *c) {
+    Command cmd(c);
+    Argument macArg = cmd.getArgument("mac");
+    String mac = macArg.getValue();
+    mac.trim();
+    Argument ssidArg = cmd.getArgument("ssid");
+    String ssid = ssidArg.getValue();
+    ssid.trim();
+    Argument chArg = cmd.getArgument("channel");
+    uint8_t channel = (uint8_t)chArg.getValue().toInt();
+    if (mac.length() == 0 || channel == 0) {
+        serialDevice->println("Usage: capturehandshake <mac> [ssid] <channel>");
+        return false;
+    }
+    if (ssid.length() == 0) ssid = "wifi";
+    serialDevice->println("Capturing handshake for " + ssid + " (" + mac + ") ch " + String(channel));
+    capture_handshake(ssid, mac, channel, true);
+    serialDevice->println("Done. Check /BrucePCAP/handshakes on the device.");
+    return true;
+}
 uint32_t listenTCPCallback(cmd *c) {
     if (!wifiConnected) {
         Serial.println("Connect to a WiFi first.");
@@ -125,6 +145,11 @@ void createWifiCommands(SimpleCLI *cli) {
 
     Command snifferCmd =
         cli->addCommand("sniffer", snifferCallback); // TODO: be able to exit from it from Serial
+
+    Command captureHS = cli->addCommand("capturehandshake", captureHandshakeCallback);
+    captureHS.addPosArg("mac");
+    captureHS.addPosArg("ssid", "");
+    captureHS.addPosArg("channel");
 
 #endif
     // Command responderCmd = cli->addCommand("responder", responderCallback); TODO

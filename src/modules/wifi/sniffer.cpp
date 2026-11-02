@@ -92,7 +92,7 @@ const size_t SNIFFER_QUEUE_DEPTH = 48;
 std::set<uint64_t> handshakeReadyBssids;
 portMUX_TYPE handshakeReadyMux = portMUX_INITIALIZER_UNLOCKED;
 std::set<uint64_t> handshakeBeaconLogged;
-std::map<uint64_t, HandshakeTracker> perApHandshakeTracker;
+std::map<uint64_t, std::map<uint64_t, HandshakeTracker>> perApHandshakeTracker;
 
 // --- 4-way handshake frame buffer ---
 // Buffer M1, M2, and M3 in memory; flush all 4 frames when M4 arrives.
@@ -108,7 +108,7 @@ struct Eapol4WayBuffer {
     EapolFrame m2;
     EapolFrame m3;
 };
-std::map<uint64_t, Eapol4WayBuffer> eapol4WayBuffer;
+std::map<uint64_t, std::map<uint64_t, Eapol4WayBuffer>> eapol4WayBuffer;
 
 // --- Raw beacon cache (per AP) ---
 // Keeps the last beacon frame seen for an AP so it can be written as the
@@ -289,6 +289,24 @@ bool matchesTargetAP(const wifi_promiscuous_pkt_t *pkt, const uint8_t targetBssi
            memcmp(addr3, targetBssid, 6) == 0;
 }
 
+// Offset of the ANonce inside an EAPOL-Key frame: the 24-byte 802.11 header
+// (plus 2 for QoS), the 8-byte LLC/SNAP header, the 4-byte EAPOL header, and
+// 13 bytes into the descriptor body (type 1 + key info 2 + key length 2 +
+// replay counter 8).
+static int anonceOffset(const uint8_t *payload) {
+    return 24 + (((payload[0] & 0x0F) == 0x08) ? 2 : 0) + 8 + 4 + 13;
+}
+
+// Whether this M1 belongs to the exchange already in the buffer. A retransmit
+// of the same message repeats its ANonce; the start of a new exchange cannot,
+// because the access point issues a fresh one every time.
+static bool sameAnonce(const uint8_t *raw, const uint8_t *buffered, uint16_t bufferedLen) {
+    if (!buffered || bufferedLen < 32) { return false; }
+    const int off = anonceOffset(raw);
+    if ((int)bufferedLen < off + 32) { return false; }
+    return memcmp(raw + off, buffered + off, 32) == 0;
+}
+
 // Définition de l'en-tête d'un paquet PCAP
 typedef struct pcaprec_hdr_s {
     uint32_t ts_sec;   /* timestamp secondes */
@@ -334,17 +352,41 @@ void saveHandshake(const wifi_promiscuous_pkt_t *packet, bool beacon, FS &Fs, co
         return;
     }
 
-    // --- EAPOL frame handling (require M1+M2+M3+M4) ---
+    // --- EAPOL frame handling ---
+    // M1+M2+M3 is what a cracker can verify against; M4 only completes the
+    // record for tools that want the full exchange. Requiring all four before
+    // writing anything meant a single lost message discarded the whole
+    // exchange, and M4 -- the message with no MIC, which many access points
+    // never repeat -- is the one lost most often.
     int eapolMsg = classifyEapolMessage(packet);
     if (eapolMsg < 1 || eapolMsg > 4) { return; }
 
-    auto &tracker = perApHandshakeTracker[apKey];
-    auto &buf = eapol4WayBuffer[apKey];
+    // One session per (access point, client). A deauthentication burst knocks
+    // every client off the network, so they all reconnect at once and their
+    // messages interleave; one shared tracker per access point meant the first
+    // client to speak latched the state and every other client was dropped
+    // silently for the rest of the capture.
+    const uint8_t *sta = (apAddr == addr1) ? addr2 : addr1;
+    uint64_t staKey = macToKey(sta);
+    auto &trackers = perApHandshakeTracker[apKey];
+    auto &buffers = eapol4WayBuffer[apKey];
+    auto &tracker = trackers[staKey];
+    auto &buf = buffers[staKey];
     uint16_t dataLen = std::min<uint16_t>(packet->rx_ctrl.sig_len, EAPOL_BUF_SIZE);
 
     // M1: buffer — don't write to file yet
     if (eapolMsg == 1) {
-        if (tracker.msg1) { return; }
+        // A second M1 from this client is a *new* exchange, not a duplicate: it
+        // carries a fresh ANonce. The old flags latched permanently, so one
+        // lost message turned every later attempt into a session that could
+        // never write a file however long the capture ran -- which is how a
+        // capture that knocks a network over twenty times still ends with
+        // nothing on the card.
+        if (tracker.msg1 && !sameAnonce(packet->payload, buf.m1.data, buf.m1.len)) {
+            tracker = HandshakeTracker();
+            buf = Eapol4WayBuffer();
+        }
+        if (tracker.msg1) { return; }  // a genuine retransmission of this one
         tracker.msg1 = true;
         memcpy(buf.m1.data, packet->payload, dataLen);
         buf.m1.len = dataLen;
@@ -364,7 +406,7 @@ void saveHandshake(const wifi_promiscuous_pkt_t *packet, bool beacon, FS &Fs, co
         return;
     }
 
-    // M3: buffer — don't write to file yet
+    // M3: buffer, then write the handshake out
     if (eapolMsg == 3) {
         if (!tracker.msg2 || tracker.msg3) { return; }
         tracker.msg3 = true;
@@ -372,14 +414,11 @@ void saveHandshake(const wifi_promiscuous_pkt_t *packet, bool beacon, FS &Fs, co
         buf.m3.len = dataLen;
         buf.m3.timestamp_sec = packet->rx_ctrl.timestamp / 1000000;
         buf.m3.timestamp_usec = packet->rx_ctrl.timestamp % 1000000;
-        return;
-    }
 
-    // M4: flush all 4 frames to file, mark handshake valid
-    if (eapolMsg == 4) {
-        if (!tracker.msg3 || tracker.msg4) { return; }
-        tracker.msg4 = true;
-
+        // M1+M2+M3 is the message pair a cracker verifies, so this is where the
+        // file is written. Waiting for M4 meant the capture sat deauthing for
+        // the rest of its window with a complete handshake in memory and
+        // nothing on the card to show for it.
         if (!Fs.exists("/BrucePCAP")) { Fs.mkdir("/BrucePCAP"); }
         if (!Fs.exists("/BrucePCAP/handshakes")) { Fs.mkdir("/BrucePCAP/handshakes"); }
 
@@ -387,7 +426,7 @@ void saveHandshake(const wifi_promiscuous_pkt_t *packet, bool beacon, FS &Fs, co
 
         File f = Fs.open(filePath, FILE_APPEND);
         if (!f) {
-            eapol4WayBuffer.erase(apKey);
+            buffers.erase(staKey);
             return;
         }
 
@@ -422,19 +461,20 @@ void saveHandshake(const wifi_promiscuous_pkt_t *packet, bool beacon, FS &Fs, co
         writeFrame(buf.m2);
         writeFrame(buf.m3);
 
-        uint16_t m4Len = dataLen;
-        hdr.ts_sec = packet->rx_ctrl.timestamp / 1000000;
-        hdr.ts_usec = packet->rx_ctrl.timestamp % 1000000;
-        hdr.incl_len = m4Len;
-        hdr.orig_len = m4Len;
-        f.write((const byte *)&hdr, sizeof(pcaprec_hdr_t));
-        f.write(packet->payload, m4Len);
-
         f.close();
-        eapol4WayBuffer.erase(apKey);
+        buffers.erase(staKey);
 
         if (handshakeReadyBssids.find(apKey) == handshakeReadyBssids.end()) { num_HS++; }
         markHandshakeReady(apKey);
+        return;
+    }
+
+    // M4: the exchange is already on the card by the time this arrives.
+    if (eapolMsg == 4) {
+        if (tracker.msg4) { return; }
+        tracker.msg4 = true;
+        if (handshakeReadyBssids.find(apKey) != handshakeReadyBssids.end()) { return; }
+        // M3 never made it, so there is nothing complete to write.
         return;
     }
 }
@@ -654,6 +694,19 @@ static FrameInfo analyzeFrame(wifi_promiscuous_pkt_t *pkt) {
         beaconLastSeen[info.apKey] = (uint32_t)millis();
     }
 
+    // A data frame names its access point and the device on the other end, and
+    // WPA2 leaves the header in the clear even when the payload is encrypted.
+    // Both directions count: addr2 for a frame sent to the access point,
+    // addr1 for one sent out by it. The station-to-station case (both flags set)
+    // has neither slot holding the AP, so its two addresses are both stations --
+    // still worth counting, which is why it goes through the same set.
+    if (frameType == 0x02) {
+        const uint8_t *a1 = frame + 4;
+        const uint8_t *a2 = frame + 10;
+        if (memcmp(a1, apAddr, 6) != 0) { noteStationForAp(info.apKey, a1); }
+        if (memcmp(a2, apAddr, 6) != 0) { noteStationForAp(info.apKey, a2); }
+    }
+
     return info;
 }
 
@@ -665,6 +718,43 @@ static uint64_t macToKey(const void *mac) {
 }
 
 static void copyMac(uint8_t *dest, const uint8_t *src) { memcpy(dest, src, 6); }
+
+// --- Stations seen per access point ---
+// WPA2 encrypts the payload, never the MAC header, so every data frame names
+// both the access point and the device on the other end. Counting those tells
+// us how many devices are actually on a network, which is the question that
+// decides whether a deauthentication is worth sending: knocking a network with
+// nobody on it produces five minutes of nothing, and from the outside that looks
+// exactly like a network that will not hand over a client.
+//
+// A lower bound, not a census. A device that is associated and idle -- power
+// save, no traffic since the capture began -- may not appear until it has
+// something to send. It counts devices we heard, never devices that exist.
+static std::map<uint64_t, std::set<uint64_t>> apStations;
+// Bounded so a busy channel cannot grow this without limit on a 96 KB heap.
+static constexpr size_t MAX_STATIONS_PER_AP = 24;
+static portMUX_TYPE apStationsMux = portMUX_INITIALIZER_UNLOCKED;
+
+void noteStationForAp(uint64_t apKey, const uint8_t *mac) {
+    portENTER_CRITICAL(&apStationsMux);
+    auto &stations = apStations[apKey];
+    if (stations.size() < MAX_STATIONS_PER_AP) { stations.insert(macToKey(mac)); }
+    portEXIT_CRITICAL(&apStationsMux);
+}
+
+uint8_t stationCountForAp(uint64_t apKey) {
+    portENTER_CRITICAL(&apStationsMux);
+    auto it = apStations.find(apKey);
+    uint8_t count = it == apStations.end() ? 0 : (uint8_t)it->second.size();
+    portEXIT_CRITICAL(&apStationsMux);
+    return count;
+}
+
+void resetStationsForAp(uint64_t apKey) {
+    portENTER_CRITICAL(&apStationsMux);
+    apStations.erase(apKey);
+    portEXIT_CRITICAL(&apStationsMux);
+}
 
 static void copySsidToBuffer(const String &ssid, char *buffer, size_t len) {
     if (!buffer || len == 0) return;
@@ -1168,7 +1258,7 @@ void sniffer_setup() {
     SnifferMode startMode = sniffer_full_mode_available() ? SnifferMode::Full : SnifferMode::HandshakesOnly;
     sniffer_set_mode(startMode);
 
-    tft.setTextSize(FP);
+    tft.setTextSize(BRUCE_FP);
     tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
     tft.setCursor(10, BORDER_PAD_Y + FM * LH);
     tft.println("Sniffing Started");
@@ -1368,7 +1458,7 @@ void sniffer_setup() {
             tft.drawPixel(0, 0, 0);
             drawMainBorderWithTitle("pcap sniffer", clearScreen); // Clear Screen and redraw border
             clearScreen = false;
-            tft.setTextSize(FP);
+            tft.setTextSize(BRUCE_FP);
             tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
             String activeFile = "File: ";
             if (sniffer_get_mode() == SnifferMode::Full && rawCaptureEnabled()) {
